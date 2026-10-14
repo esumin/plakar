@@ -2,9 +2,11 @@ package repair
 
 import (
 	"bytes"
+	"context"
 	"testing"
 	"time"
 
+	"github.com/PlakarKorp/kloset/connectors/storage"
 	"github.com/PlakarKorp/kloset/objects"
 	"github.com/PlakarKorp/kloset/repository"
 	ptesting "github.com/PlakarKorp/plakar/testing"
@@ -108,10 +110,44 @@ func TestCov80RepairApplyReleasesOwnLock(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, status)
 
-	// Unlock is asynchronous (the ping goroutine performs DeleteLock), so poll.
-	require.Eventually(t, func() bool {
-		locks, lerr := repo.GetLocks()
-		require.NoError(t, lerr)
-		return len(locks) == 0
-	}, 2*time.Second, 10*time.Millisecond, "repair must release its own lock on exit")
+	locks, err := repo.GetLocks()
+	require.NoError(t, err)
+	require.Empty(t, locks, "repair must release its own lock before returning")
+}
+
+// Slow lock deletion, like on a remote store.
+type slowLockStore struct {
+	storage.Store
+}
+
+func (s slowLockStore) Delete(ctx context.Context, res storage.StorageResource, mac objects.MAC) error {
+	if res == storage.StorageResourceLock {
+		time.Sleep(100 * time.Millisecond)
+	}
+	return s.Store.Delete(ctx, res, mac)
+}
+
+func TestRepairApplyWaitsForLockDeletion(t *testing.T) {
+	repo, ctx := ptesting.GenerateRepository(t, bytes.NewBuffer(nil), bytes.NewBuffer(nil), nil)
+	snap := ptesting.GenerateSnapshot(t, repo, []ptesting.MockFile{
+		ptesting.NewMockDir("d"),
+		ptesting.NewMockFile("d/f.txt", 0644, "payload"),
+	})
+	defer snap.Close()
+
+	config, err := repo.Store().Open(ctx)
+	require.NoError(t, err)
+	slow, err := repository.NewRepository(ctx.GetInner(), nil, slowLockStore{repo.Store()}, config,
+		&repository.RepositoryOpts{DoRebuild: true, RWStateCache: true})
+	require.NoError(t, err)
+
+	cmd := &Repair{}
+	require.NoError(t, cmd.Parse(ctx, []string{"-apply"}))
+	status, err := cmd.Execute(ctx, slow)
+	require.NoError(t, err)
+	require.Equal(t, 0, status)
+
+	locks, err := slow.GetLocks()
+	require.NoError(t, err)
+	require.Empty(t, locks, "repair must release its own lock before returning")
 }

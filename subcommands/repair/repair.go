@@ -35,8 +35,9 @@ type Repair struct {
 
 	Apply bool
 
-	repository *repository.Repository
-	repairID   objects.MAC
+	repository   *repository.Repository
+	repairID     objects.MAC
+	lockReleased chan error
 }
 
 func init() {
@@ -179,6 +180,7 @@ func (cmd *Repair) Execute(ctx *appcontext.AppContext, repo *repository.Reposito
 
 func (cmd *Repair) Lock() (chan bool, error) {
 	lockDone := make(chan bool)
+	cmd.lockReleased = make(chan error, 1)
 	lock := repository.NewExclusiveLock(cmd.repository.AppContext().Hostname)
 
 	buffer := &bytes.Buffer{}
@@ -244,7 +246,7 @@ func (cmd *Repair) Lock() (chan bool, error) {
 		for {
 			select {
 			case <-lockDone:
-				cmd.repository.DeleteLock(cmd.repairID)
+				cmd.lockReleased <- cmd.repository.DeleteLock(cmd.repairID)
 				return
 			case <-time.After(repository.LOCK_REFRESH_RATE):
 				lock := repository.NewExclusiveLock(cmd.repository.AppContext().Hostname)
@@ -265,4 +267,8 @@ func (cmd *Repair) Lock() (chan bool, error) {
 
 func (cmd *Repair) Unlock(ping chan bool) {
 	close(ping)
+	// The process may exit right after, wait for the lock to be gone.
+	if err := <-cmd.lockReleased; err != nil {
+		cmd.repository.Logger().Warn("repair: could not delete lock %x: %v", cmd.repairID, err)
+	}
 }

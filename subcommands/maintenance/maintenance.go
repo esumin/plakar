@@ -62,6 +62,7 @@ type Maintenance struct {
 	repository    *repository.Repository
 	maintenanceID objects.MAC
 	cutoff        time.Time
+	lockReleased  chan error
 }
 
 // Builds the local cache of snapshot -> packfiles
@@ -378,7 +379,9 @@ func (cmd *Maintenance) Execute(ctx *appcontext.AppContext, repo *repository.Rep
 func (cmd *Maintenance) Lock() (chan bool, error) {
 	lockless, _ := strconv.ParseBool(os.Getenv("PLAKAR_LOCKLESS"))
 	lockDone := make(chan bool)
+	cmd.lockReleased = make(chan error, 1)
 	if lockless {
+		close(cmd.lockReleased)
 		return lockDone, nil
 	}
 
@@ -448,7 +451,7 @@ func (cmd *Maintenance) Lock() (chan bool, error) {
 		for {
 			select {
 			case <-lockDone:
-				cmd.repository.DeleteLock(cmd.maintenanceID)
+				cmd.lockReleased <- cmd.repository.DeleteLock(cmd.maintenanceID)
 				return
 			case <-time.After(repository.LOCK_REFRESH_RATE):
 				lock := repository.NewExclusiveLock(cmd.repository.AppContext().Hostname)
@@ -469,4 +472,8 @@ func (cmd *Maintenance) Lock() (chan bool, error) {
 
 func (cmd *Maintenance) Unlock(ping chan bool) {
 	close(ping)
+	// The process may exit right after, wait for the lock to be gone.
+	if err := <-cmd.lockReleased; err != nil {
+		cmd.repository.Logger().Warn("maintenance: could not delete lock %x: %v", cmd.maintenanceID, err)
+	}
 }

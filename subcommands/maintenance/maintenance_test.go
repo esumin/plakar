@@ -2,6 +2,7 @@ package maintenance
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"strings"
@@ -44,13 +45,7 @@ func freshRepo(t *testing.T) (*repository.Repository, *appcontext.AppContext, *b
 }
 
 // runMaintenance constructs and runs a Maintenance subcommand. Output buffers
-// are cleared first so each call sees only its own log lines. Because Unlock
-// only closes the ping channel and the background goroutine performs the
-// actual DeleteLock asynchronously, we wait for the lock count to settle
-// back to its pre-Execute value before returning. Otherwise back-to-back
-// runs can race: run N+1's Lock() calls GetLocks() and sees run N's
-// not-yet-deleted lock, then races GetLock(N's MAC) against the background
-// DeleteLock and fails with "no such file or directory".
+// are cleared first so each call sees only its own log lines.
 //
 //nolint:staticcheck // ST1008: test helper, error kept in fixed position alongside other outputs
 func runMaintenance(t *testing.T, ctx *appcontext.AppContext, repo *repository.Repository,
@@ -59,25 +54,9 @@ func runMaintenance(t *testing.T, ctx *appcontext.AppContext, repo *repository.R
 	bufOut.Reset()
 	bufErr.Reset()
 
-	locksBefore, err := repo.GetLocks()
-	require.NoError(t, err)
-	preCount := len(locksBefore)
-
 	cmd := &Maintenance{}
 	require.NoError(t, cmd.Parse(ctx, nil))
 	status, err := cmd.Execute(ctx, repo)
-
-	// Wait for any lock the maintenance goroutine installed to drain. If
-	// Execute errored without ever taking a lock the count may already be
-	// at preCount; Eventually returns immediately in that case.
-	require.Eventually(t, func() bool {
-		locks, lerr := repo.GetLocks()
-		if lerr != nil {
-			return false
-		}
-		return len(locks) <= preCount
-	}, 2*time.Second, 10*time.Millisecond,
-		"maintenance lock must be released before next run")
 
 	return status, err, bufOut.String(), bufErr.String()
 }
@@ -739,14 +718,40 @@ func TestExecuteLockReleasedAfterRun(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, status)
 
-	// Unlock is asynchronous: Unlock() only closes the ping channel and the
-	// background goroutine then performs DeleteLock. Poll briefly until the
-	// lock disappears (or fail after ~1s).
-	require.Eventually(t, func() bool {
-		locks, err := repo.GetLocks()
-		require.NoError(t, err)
-		return len(locks) == 0
-	}, time.Second, 10*time.Millisecond, "maintenance must remove its own lock on exit")
+	locks, err := repo.GetLocks()
+	require.NoError(t, err)
+	require.Empty(t, locks, "maintenance must remove its own lock before returning")
+}
+
+// Slow lock deletion, like on a remote store.
+type slowLockStore struct {
+	storage.Store
+}
+
+func (s slowLockStore) Delete(ctx context.Context, res storage.StorageResource, mac objects.MAC) error {
+	if res == storage.StorageResourceLock {
+		time.Sleep(100 * time.Millisecond)
+	}
+	return s.Store.Delete(ctx, res, mac)
+}
+
+func TestExecuteWaitsForLockDeletion(t *testing.T) {
+	repo, ctx, bufOut, bufErr := freshRepo(t)
+	ptesting.GenerateSnapshot(t, repo, simpleFiles())
+
+	config, err := repo.Store().Open(ctx)
+	require.NoError(t, err)
+	slow, err := repository.NewRepository(ctx.GetInner(), nil, slowLockStore{repo.Store()}, config,
+		&repository.RepositoryOpts{DoRebuild: true, RWStateCache: true})
+	require.NoError(t, err)
+
+	status, err, _, _ := runMaintenance(t, ctx, slow, bufOut, bufErr)
+	require.NoError(t, err)
+	require.Equal(t, 0, status)
+
+	locks, err := slow.GetLocks()
+	require.NoError(t, err)
+	require.Empty(t, locks, "maintenance must remove its own lock before returning")
 }
 
 // --- Deleted snapshot cache cleanup ---------------------------------------
